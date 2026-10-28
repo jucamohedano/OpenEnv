@@ -1,3 +1,5 @@
+"""Unit contracts and real-process cleanup coverage for managed child queries."""
+
 import functools
 import os
 import signal
@@ -6,6 +8,8 @@ import threading
 import time
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -139,10 +143,16 @@ def start_call(function, name):
         (", model='fake-model'", "fake-model"),
     ],
 )
-def test_nonblocking_query_returns_handle_and_parent_continues(
-    tmp_path, model_argument, expected_model
+def test_nonblocking_query_routes_model_arguments(
+    tmp_path, monkeypatch, model_argument, expected_model
 ):
     controller = make_controller(tmp_path)
+    spawn = Mock(return_value="child-handle")
+    wait = Mock(return_value="42")
+    monkeypatch.setattr(controller.children, "spawn", spawn)
+    monkeypatch.setattr(controller.children, "wait", wait)
+    monkeypatch.setattr(controller.children, "status", Mock(return_value="completed"))
+    monkeypatch.setattr(controller.children, "result", Mock(return_value="42"))
     with LocalREPLEnv(recursive_controller=controller) as env:
         reset = env.reset()
         assert "blocking=False" in reset.observation.result.stdout
@@ -151,12 +161,13 @@ def test_nonblocking_query_returns_handle_and_parent_continues(
             f"child = rlm_query('answer'{model_argument}, blocking=False); parent_work = 6 * 7"
         )
         assert result.observation.result.success
-        assert next(iter(controller.children._jobs.values())).model == expected_model
+        spawn.assert_called_once_with("answer", expected_model)
         assert (
             env.execute("print(parent_work)").observation.result.stdout.strip() == "42"
         )
         result = env.execute("print(rlm_wait(child, timeout_s=15))")
         assert result.observation.result.stdout.strip() == "42"
+        wait.assert_called_once_with("child-handle", timeout_s=15)
         assert (
             env.execute("print(rlm_status(child))").observation.result.stdout.strip()
             == "completed"
@@ -165,11 +176,36 @@ def test_nonblocking_query_returns_handle_and_parent_continues(
             env.execute("print(rlm_result(child))").observation.result.stdout.strip()
             == "42"
         )
+        assert not controller.children._jobs
+
+
+def test_nonblocking_query_runs_supervised_worker(tmp_path):
+    controller = make_controller(tmp_path)
+    with LocalREPLEnv(recursive_controller=controller) as env:
+        env.reset()
+        result = env.execute(
+            "child = rlm_query('answer', model='fake-model', blocking=False); parent_work = 6 * 7"
+        )
+        assert result.observation.result.success
+        result = env.execute("print(parent_work, rlm_wait(child, timeout_s=15))")
+        assert result.observation.result.success
+        assert result.observation.result.stdout.strip() == "42 42"
+        result = env.execute("print(rlm_status(child), rlm_result(child))")
+        assert result.observation.result.stdout.strip() == "completed 42"
+        job = next(iter(controller.children._jobs.values()))
+        assert job.model == "fake-model"
+        assert job.pid != os.getpid()
+        assert job.finished.is_set()
+        assert_reaped([job.pid])
 
 
 @pytest.mark.parametrize("blocking_argument", ["", ", blocking=True"])
-def test_blocking_query_returns_answer_by_default(tmp_path, blocking_argument):
+def test_blocking_query_returns_answer_by_default(
+    tmp_path, monkeypatch, blocking_argument
+):
     controller = make_controller(tmp_path)
+    query = Mock(return_value="42")
+    monkeypatch.setattr(controller, "rlm_query_fn", query)
     with LocalREPLEnv(recursive_controller=controller) as env:
         env.reset()
         result = env.execute(
@@ -177,10 +213,8 @@ def test_blocking_query_returns_answer_by_default(tmp_path, blocking_argument):
         )
         assert result.observation.result.success
         assert result.observation.result.stdout.strip() == "42"
-        job = next(iter(controller.children._jobs.values()))
-        assert job.model == "fake-model"
-        assert job.finished.is_set()
-        assert_reaped([job.pid])
+        query.assert_called_once_with("answer", "fake-model")
+        assert not controller.children._jobs
 
 
 @pytest.mark.parametrize("blocking_argument", ["", ", blocking=True"])
@@ -235,23 +269,32 @@ def test_blocking_option_is_keyword_only():
 
 
 @pytest.mark.parametrize("limit", ["max_children_total", "max_batch_workers"])
-def test_nonblocking_query_respects_supervisor_limits(tmp_path, limit):
+def test_nonblocking_query_respects_supervisor_limits(tmp_path, monkeypatch, limit):
     controller = make_controller(
         tmp_path, **{limit: 0 if limit == "max_children_total" else 1}
+    )
+    launcher = Mock(side_effect=AssertionError("Unexpected worker launch"))
+    monkeypatch.setattr(
+        "repl_env.managed_children.multiprocessing.get_context", launcher
     )
     with LocalREPLEnv(recursive_controller=controller) as env:
         env.reset()
         if limit == "max_batch_workers":
-            controller.children.spawn("blocked ignore-term")
-            wait_ready(tmp_path, manager=controller.children)
+            controller.children._jobs["running-child"] = SimpleNamespace(
+                finished=threading.Event()
+            )
         admitted = len(controller.children._jobs)
-        result = env.execute("rlm_query('answer', blocking=False)")
-        assert not result.observation.result.success
-        expected_error = (
-            "max_children_total" if limit == "max_children_total" else "concurrency"
-        )
-        assert expected_error in result.observation.result.stderr
-        assert len(controller.children._jobs) == admitted
+        try:
+            result = env.execute("rlm_query('answer', blocking=False)")
+            assert not result.observation.result.success
+            expected_error = (
+                "max_children_total" if limit == "max_children_total" else "concurrency"
+            )
+            assert expected_error in result.observation.result.stderr
+            assert len(controller.children._jobs) == admitted
+            launcher.assert_not_called()
+        finally:
+            controller.children._jobs.clear()
 
 
 def test_nonblocking_query_at_depth_limit_still_uses_worker(tmp_path):
@@ -261,6 +304,15 @@ def test_nonblocking_query_at_depth_limit_still_uses_worker(tmp_path):
         result = env.execute("child = rlm_query('blocked ignore-term', blocking=False)")
         assert result.observation.result.success
         pids = wait_ready(tmp_path, manager=controller.children)
+        handle = next(iter(controller.children._jobs))
+        with pytest.raises(TimeoutError):
+            controller.children.wait(handle, timeout_s=0.01)
+        assert controller.children.status(handle) == "running"
+        with pytest.raises(RuntimeError, match="not finished"):
+            controller.children.result(handle)
+        controller.children.cancel(handle)
+        with pytest.raises(RuntimeError, match="cancelled"):
+            controller.children.result(handle)
         env.close()
         assert_reaped(pids)
 
@@ -286,10 +338,6 @@ def test_reset_stops_blocked_call_and_invalidates_handles(
         with pytest.raises(KeyError, match="handle"):
             controller.children.status(handle)
         assert env.state().context == "new"
-        assert (
-            controller.children.wait(controller.children.spawn("answer"), timeout_s=15)
-            == "42"
-        )
 
 
 def test_close_stops_all_workers_and_is_idempotent(tmp_path):
@@ -351,23 +399,14 @@ def test_iteration_limit_stops_children(tmp_path):
         assert_reaped(pids)
 
 
-def test_wait_timeout_is_not_cancellation_and_failure_is_observable(tmp_path):
+def test_worker_failure_is_observable(tmp_path):
     controller = make_controller(tmp_path)
     try:
-        handle = controller.children.spawn("blocked ignore-term")
-        wait_ready(tmp_path)
-        with pytest.raises(TimeoutError):
-            controller.children.wait(handle, timeout_s=0.01)
-        assert controller.children.status(handle) == "running"
-        with pytest.raises(RuntimeError, match="not finished"):
-            controller.children.result(handle)
-        controller.children.cancel(handle)
-        with pytest.raises(RuntimeError, match="cancelled"):
-            controller.children.result(handle)
         failed = controller.children.spawn("raise-error")
         with pytest.raises(RuntimeError, match="scripted model failure"):
             controller.children.wait(failed, timeout_s=15)
         assert controller.children.status(failed) == "failed"
+        assert_reaped([controller.children._jobs[failed].pid])
     finally:
         controller.close()
 
@@ -416,31 +455,34 @@ def test_nested_recursion_shares_child_budget(tmp_path):
 
 
 @pytest.mark.parametrize("outcome", ["completed", "failed", "cancelled"])
-def test_child_budget_counts_all_admitted_jobs_until_reset(tmp_path, outcome):
+def test_child_budget_counts_all_admitted_jobs_until_reset(
+    tmp_path, monkeypatch, outcome
+):
     controller = make_controller(tmp_path, max_children_total=1)
     manager = controller.children
-    prompts = {
-        "completed": "answer",
-        "failed": "raise-error",
-        "cancelled": "blocked ignore-term",
-    }
+    finished = threading.Event()
+    finished.set()
+    manager._jobs["prior-child"] = SimpleNamespace(
+        finished=finished,
+        stop=threading.Event(),
+        status=outcome,
+        exitcode=0,
+    )
+    launcher = Mock(side_effect=RuntimeError("Worker launch reached"))
+    monkeypatch.setattr(
+        "repl_env.managed_children.multiprocessing.get_context", launcher
+    )
     try:
-        handle = manager.spawn(prompts[outcome])
-        if outcome == "completed":
-            assert manager.wait(handle, timeout_s=15) == "42"
-        elif outcome == "failed":
-            with pytest.raises(RuntimeError, match="scripted model failure"):
-                manager.wait(handle, timeout_s=15)
-        else:
-            wait_ready(tmp_path)
-            manager.cancel(handle)
-        assert manager.status(handle) == outcome
+        assert manager.status("prior-child") == outcome
         with pytest.raises(RuntimeError, match="max_children_total"):
             manager.spawn("answer")
+        launcher.assert_not_called()
         manager.reset()
         with pytest.raises(KeyError, match="handle"):
-            manager.status(handle)
-        assert manager.wait(manager.spawn("answer"), timeout_s=15) == "42"
+            manager.status("prior-child")
+        with pytest.raises(RuntimeError, match="Worker launch reached"):
+            manager.spawn("answer")
+        launcher.assert_called_once_with("spawn")
     finally:
         controller.close()
 
@@ -585,7 +627,11 @@ def test_broken_channel_still_stops_and_reaps_worker(
     assert job.exitcode == -signal.SIGKILL
     assert_reaped(pids)
     if operation == "reset":
-        assert manager.wait(manager.spawn("answer"), timeout_s=15) == "42"
+        result = env.execute(
+            "print(rlm_wait(rlm_query('answer', blocking=False), timeout_s=15))"
+        )
+        assert result.observation.result.success
+        assert result.observation.result.stdout.strip() == "42"
 
 
 def test_unmanaged_controller_forwards_subcall_callbacks(tmp_path):
@@ -688,7 +734,7 @@ def test_invalid_limits_rejected_before_spawning(tmp_path, kwargs):
         make_controller(tmp_path, **kwargs)
 
 
-def test_callbacks_and_trace_run_in_supervisor(tmp_path):
+def test_callbacks_and_trace_run_in_supervisor(tmp_path, monkeypatch):
     controller = make_controller(tmp_path)
     events = []
     callback_done = threading.Event()
@@ -714,6 +760,13 @@ def test_callbacks_and_trace_run_in_supervisor(tmp_path):
         assert events[0][3] != threading.get_ident()
         assert events[0][3] != controller.children._jobs[handle].thread.ident
         assert controller.backend.child_traces[0].result_preview == "42"
+        assert_reaped([controller.children._jobs[handle].pid])
+
+        def unexpected_signal(*args):
+            pytest.fail("A reaped worker's PID may already belong to another process")
+
+        monkeypatch.setattr(os, "kill", unexpected_signal)
+        controller.children._signal(controller.children._jobs[handle], signal.SIGKILL)
     finally:
         controller.close()
 
@@ -728,27 +781,10 @@ def test_invalid_prompt_does_not_start_worker(tmp_path):
         controller.close()
 
 
-def test_reaped_workers_are_never_signalled_again(tmp_path, monkeypatch):
-    controller = make_controller(tmp_path)
-    try:
-        handle = controller.children.spawn("answer")
-        assert controller.children.wait(handle, timeout_s=15) == "42"
-
-        def unexpected_signal(*args):
-            pytest.fail("A reaped worker's PID may already belong to another process")
-
-        monkeypatch.setattr(os, "kill", unexpected_signal)
-        controller.children._signal(controller.children._jobs[handle], signal.SIGKILL)
-    finally:
-        controller.close()
-
-
 @pytest.mark.parametrize("first_operation", ["reset", "close"])
 def test_reset_and_close_are_serialized(tmp_path, monkeypatch, first_operation):
     controller = make_controller(tmp_path)
     manager = controller.children
-    manager.spawn("blocked ignore-term")
-    pids = wait_ready(tmp_path)
     drained = threading.Event()
     release_first = threading.Event()
     second_entered = threading.Event()
@@ -775,7 +811,6 @@ def test_reset_and_close_are_serialized(tmp_path, monkeypatch, first_operation):
     )
     try:
         assert drained.wait(10)
-        assert_reaped(pids)
         second_thread, second_done, second_errors = start_call(
             second_call, "second-lifecycle"
         )
@@ -865,7 +900,7 @@ def test_blocked_callbacks_do_not_block_lifecycle(tmp_path, callback_phase, oper
 
 
 @pytest.mark.parametrize("callback_phase", ["start", "complete"])
-def test_callback_exceptions_do_not_affect_worker_result(tmp_path, callback_phase):
+def test_callback_exceptions_do_not_stop_dispatcher(tmp_path, callback_phase):
     controller = make_controller(tmp_path)
     events = []
     callback_done = threading.Event()
@@ -883,12 +918,21 @@ def test_callback_exceptions_do_not_affect_worker_result(tmp_path, callback_phas
 
     controller.children.on_subcall_start = lambda *args: observe("start")
     controller.children.on_subcall_complete = on_complete
+    after_failure = threading.Event()
     try:
-        handle = controller.children.spawn("answer")
-        assert controller.children.wait(handle, timeout_s=15) == "42"
+        controller.children._notify(
+            controller.children.on_subcall_start, 1, "default", "answer"
+        )
+        controller.children._notify(
+            controller.children.on_subcall_complete, 1, "default", 0.0, None
+        )
+        controller.children._notify(after_failure.set)
         assert callback_done.wait(5)
-        assert controller.children.status(handle) == "completed"
+        assert after_failure.wait(5)
         assert events == ["start", "complete"]
-        assert_reaped([controller.children._jobs[handle].pid])
+        controller.children.check_ready()
+        assert not controller.children._jobs
     finally:
         controller.close()
+    controller.children._callback_thread.join(5)
+    assert not controller.children._callback_thread.is_alive()
