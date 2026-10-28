@@ -389,6 +389,46 @@ def test_parent_finalization_stops_children(tmp_path, final_code):
         ).observation.result.success
 
 
+@pytest.mark.parametrize(
+    "final_code",
+    ["print(FINAL(42))", "answer.update({'content': '42', 'ready': True})"],
+)
+def test_final_answer_survives_cleanup_failure(tmp_path, monkeypatch, final_code):
+    controller = make_controller(tmp_path)
+    manager = controller.children
+    env = LocalREPLEnv(recursive_controller=controller)
+    env.reset(context="original episode")
+    finished = Mock(spec=threading.Event)
+    finished.wait.return_value = False
+    job = SimpleNamespace(
+        stop=threading.Event(), finished=finished, status="running", exitcode=None
+    )
+    manager._jobs["unconfirmed-child"] = job
+    launcher = Mock(side_effect=AssertionError("Unexpected worker launch"))
+    monkeypatch.setattr(
+        "repl_env.managed_children.multiprocessing.get_context", launcher
+    )
+    try:
+        with pytest.raises(ChildCleanupError, match="exit could not be confirmed"):
+            env.execute(final_code)
+        assert env.state().final_answer == "42"
+        assert manager._cleanup_failed
+        assert job.stop.is_set()
+        finished.wait.assert_called_once()
+        with pytest.raises(ChildCleanupError, match="cannot be reused"):
+            env.execute("print('must not execute')")
+        with pytest.raises(ChildCleanupError, match="cannot be reused"):
+            manager.spawn("answer")
+        with pytest.raises(ChildCleanupError, match="exit could not be confirmed"):
+            env.reset(context="replacement episode")
+        assert env.state().context == "original episode"
+        assert env.state().final_answer == "42"
+        launcher.assert_not_called()
+    finally:
+        manager._jobs.clear()
+        env.close()
+
+
 def test_iteration_limit_stops_children(tmp_path):
     controller = make_controller(tmp_path)
     with LocalREPLEnv(recursive_controller=controller) as env:

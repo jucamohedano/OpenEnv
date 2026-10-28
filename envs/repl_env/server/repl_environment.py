@@ -559,9 +559,9 @@ class REPLEnvironment(Environment):
         done = final_answer is not None
 
         if done:
+            self._state.final_answer = final_answer
             if self._managed_children is not None:
                 self._managed_children.stop()
-            self._state.final_answer = final_answer
 
         obs = REPLObservation(
             result=CodeBlockResult(
