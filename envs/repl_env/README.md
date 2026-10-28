@@ -20,6 +20,8 @@ recursive model queries, following the [RLM paradigm](https://huggingface.co/pap
 - `LocalREPLEnv`: the environment in process.
 - `LocalRLMRunner`: the model prompting, code-execution, and recursion loop.
 
+Try it on the [`openenv/repl`](https://huggingface.co/spaces/openenv/repl) Space, or connect a client to `https://openenv-repl.hf.space`.
+
 ## Quick Start
 
 Start a server:

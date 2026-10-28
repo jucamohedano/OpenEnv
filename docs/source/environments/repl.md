@@ -8,6 +8,8 @@ recursive model queries, following the [RLM paradigm](https://huggingface.co/pap
 - `LocalREPLEnv`: the environment in process.
 - `LocalRLMRunner`: the model prompting, code-execution, and recursion loop.
 
+Try it on the [`openenv/repl`](https://huggingface.co/spaces/openenv/repl) Space, or connect a client to `https://openenv-repl.hf.space`.
+
 ## Quick Start
 
 Start a server:
@@ -58,7 +60,7 @@ with LocalREPLEnv() as env:
 
 ## Server Configuration
 
-Environment variables read by [`server/app.py`](https://github.com/huggingface/OpenEnv/blob/main/envs/repl_env/server/app.py):
+Environment variables read by [`server/app.py`](https://github.com/openenv/OpenEnv/blob/main/envs/repl_env/server/app.py):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -85,7 +87,7 @@ with LocalREPLEnv() as env:
 ```
 
 Customize `LocalREPLEnv(rubric=...)` with the match, partial-credit, custom-metric,
-or execution rubrics in [`rubrics.py`](https://github.com/huggingface/OpenEnv/blob/main/envs/repl_env/rubrics.py). See the
+or execution rubrics in [`rubrics.py`](https://github.com/openenv/OpenEnv/blob/main/envs/repl_env/rubrics.py). See the
 [rubric guide](https://huggingface.co/docs/openenv/guides/rewards) for composition.
 
 ## Running an RLM Locally
@@ -126,7 +128,7 @@ print(result.final_answer)
 The runner supports child-count, batch, timeout, and result-length limits, plus
 `on_subcall_start` / `on_subcall_complete` callbacks and child traces. For different
 outer/inner models, supply a `backend_factory`; see
-[`recursive_backends.py`](https://github.com/huggingface/OpenEnv/blob/main/envs/repl_env/recursive_backends.py).
+[`recursive_backends.py`](https://github.com/openenv/OpenEnv/blob/main/envs/repl_env/recursive_backends.py).
 
 ### Managed child lifecycle (opt-in)
 
@@ -183,7 +185,7 @@ contain arbitrary subprocesses or guarantee server-side generation abort.
 User-facing cancellation and follow-up messages are deferred.
 
 For manual/server use, pass `managed_children` to
-[`create_server_recursive_controller`](https://github.com/huggingface/OpenEnv/blob/main/envs/repl_env/recursive_controller.py), then supply that
+[`create_server_recursive_controller`](https://github.com/openenv/OpenEnv/blob/main/envs/repl_env/recursive_controller.py), then supply that
 controller to `LocalREPLEnv` or `REPLEnvironment` via `recursive_controller=`.
 Configure its credentials and limits at construction, not through reset overrides;
 infrastructure can cancel a handle with `controller.children.cancel(handle)`.
@@ -194,7 +196,7 @@ infrastructure can cancel a handle with `controller.children.cancel(handle)`.
 `REPLAction` carries `code`, or `is_final=True` with a `final_answer` for explicit
 submission. `REPLObservation` includes execution results (stdout/stderr, success,
 exceptions, and timing), context/iteration metadata, `done`, and `reward`.
-See [`models.py`](https://github.com/huggingface/OpenEnv/blob/main/envs/repl_env/models.py) for all fields.
+See [`models.py`](https://github.com/openenv/OpenEnv/blob/main/envs/repl_env/models.py) for all fields.
 
 ## REPL Helpers
 
@@ -209,12 +211,12 @@ Finish by executing `print(FINAL(value))`, `print(FINAL_VAR("variable_name"))`, 
 
 ## Prompts and Examples
 
-See [`prompts.py`](https://github.com/huggingface/OpenEnv/blob/main/envs/repl_env/prompts.py) for system prompts and message/code-block helpers.
+See [`prompts.py`](https://github.com/openenv/OpenEnv/blob/main/envs/repl_env/prompts.py) for system prompts and message/code-block helpers.
 
 Examples, which default to `Qwen/Qwen3.5-9B` through Hugging Face inference (needs `HF_TOKEN`):
 
-- [`examples/repl_with_llm.py`](https://github.com/huggingface/OpenEnv/blob/main/examples/repl_with_llm.py)
-- [`examples/repl_oolong_simple.py`](https://github.com/huggingface/OpenEnv/blob/main/examples/repl_oolong_simple.py)
+- [`examples/repl_with_llm.py`](https://github.com/openenv/OpenEnv/blob/main/examples/repl_with_llm.py)
+- [`examples/repl_oolong_simple.py`](https://github.com/openenv/OpenEnv/blob/main/examples/repl_oolong_simple.py)
 
 ## References
 
